@@ -58,12 +58,14 @@ class ADParser(AbstractParser):
     page_size = 500  # not more then 1000
 
     def __init__(self, dc_list, base_dn, user, password, port=389, use_ssl=False,
-                 user_filter=None):
+                 user_filter=None, mail_attr='mail', aliases_attrs=None):
         """
         `dc_list`: list of domain controller addresses
         `user`: Username to use (either cn=blah,dc=cust,dc=local or blah@cust.local format), no special privilegies needed
-        `ou`: Org Unit (Base DN) to export from, e.g. dc=ad,dc=yourdomain,dc=com
+        `ou`: Org Unit (Base DN) to export from, e.g. dc=ad,dc=redrobot-studio,dc=com
         `use_ssl`: use LDAP over ssl (LDAPS)
+        `mail_attr`: ldap attribute that store email
+        `aliases_attrs`: list of ldap attributes that store email aliases
         """
         super(ADParser, self).__init__()
         if use_ssl:
@@ -99,6 +101,11 @@ class ADParser(AbstractParser):
         self.base_dn = base_dn
         self.use_ssl = use_ssl
 
+        self.mail_attr = str(mail_attr)
+        if not aliases_attrs:
+            aliases_attrs = ['proxyAddresses']
+        self.aliases_attrs = [str(a) for a in aliases_attrs]
+
         self.error = None
 
     def parse(self, limit=None, page_size=None):
@@ -112,15 +119,22 @@ class ADParser(AbstractParser):
 
             entry_count = 0
             for entry in accounts:
-                if hasattr(entry[1], 'has_key') \
-                                and entry[1].has_key('proxyAddresses')\
-                                and entry[1].has_key('mail'):
-                    row = self._process_row({'email': entry[1]['mail'], 'aliases': entry[1]['proxyAddresses']})
-                    parsed.append(row)
+                if hasattr(entry[1], 'has_key'):
+                    aliases = []
+                    for key in self.aliases_attrs:
+                        for alias in entry[1].get(key, []):
+                            if alias not in aliases:
+                                aliases.append(alias)
+                    mail = entry[1].get(self.mail_attr, '')
 
-                    entry_count += 1
-                    if limit and (limit <= entry_count):
-                        break
+                    if mail:
+                        row = self._process_row({'email': mail,
+                                                 'aliases': aliases})
+                        parsed.append(row)
+
+                        entry_count += 1
+                        if limit and (limit <= entry_count):
+                            break
 
         return parsed
 
@@ -130,8 +144,16 @@ class ADParser(AbstractParser):
     def prepare_aliases(self, val):
         aliases = []
         for addr in val:
+            if 'x400:' in addr.lower():
+                continue
+
+            if ' ' in addr.lower():
+                continue
+
             if 'smtp:' in addr.lower():
                 aliases.append(addr.lower().split('smtp:')[1])
+            else:
+                aliases.append(addr.lower())
 
         return aliases
 
@@ -143,6 +165,7 @@ class ADParser(AbstractParser):
         page_size = page_size or self.page_size
         paged_results_control = SimplePagedResultsControl(size=page_size,
                                                               cookie='')
+        attr_list = [self.mail_attr] + self.aliases_attrs
         accounts = []
         pages = 0
         while True:
@@ -151,7 +174,7 @@ class ADParser(AbstractParser):
                 msgid = self.ldap_connection.search_ext(self.base_dn,
                                                    ldap.SCOPE_SUBTREE,
                                                    self.user_filter,
-                                                   attrlist=['proxyAddresses', 'mail'],
+                                                   attrlist=attr_list,
                                                    serverctrls=serverctrls)
             except ldap.LDAPError, e:
                 self._set_error_from_ldap_exc(e)
@@ -193,10 +216,11 @@ class ADParser(AbstractParser):
     def _process_row(self, row):
         row = super(ADParser, self)._process_row(row)
         # remove self from aliases
-        try:
-            row['aliases'].remove(row['email'])
-        except Exception:
-            pass
+        row['aliases'] = [a for a in row['aliases'] if a != row['email']]
+
+        if '@' in row['email']:
+            localpart = row['email'].split('@')[0]
+            row['aliases'] = [a for a in row['aliases'] if a != localpart]
 
         return row
 
@@ -216,11 +240,13 @@ class ADParser(AbstractParser):
                                                ldap.OPT_X_TLS_DEMAND)
                     ldap_connection.set_option(ldap.OPT_X_TLS_DEMAND, True)
                 ldap_connection.set_option(ldap.OPT_DEBUG_LEVEL, 255)
+                ldap_connection.set_option(ldap.OPT_NETWORK_TIMEOUT, 5.0)
+                ldap_connection.set_option(ldap.OPT_TIMEOUT, 5.0)
                 ldap_connection.simple_bind_s(self.bind_DN, self.bind_pwd)
                 break #stop on successfull connection
             except ldap.LDAPError, e:
-                logger.warning('Error connecting to LDAP server: %s', str(e))
                 self._set_error_from_ldap_exc(e)
+                logger.warning('Error connecting to LDAP server: %s', self.error)
                 failed_connections += 1
 
         if failed_connections == len(self.ldap_servers):
@@ -237,7 +263,8 @@ class ADParser(AbstractParser):
 
 def get_data(args):
     parser = ADParser(args.dc_list, args.dn, args.user, args.password,
-                      args.port, args.ssl, args.search_string)
+                      args.port, args.ssl, args.search_string, args.mail_attr,
+                      args.aliases_attrs)
 
     if args.verbose:
         logger.info('Connecting to LDAP server')
@@ -303,6 +330,10 @@ if __name__ == '__main__':
                        help='Use ssl')
     parser.add_argument('--port', dest='port', action='store',
                        help='Port', default=389, type=int)
+    parser.add_argument('--mail-attr', dest='mail_attr', action='store',
+                       help='Mail attribute', default='mail', type=str)
+    parser.add_argument('--aliases-attr', dest='aliases_attrs', action='append',
+                       help='Aliases attribute', default=[], type=str)
     parser.add_argument('--search-string', dest='search_string', action='store',
                        help='LDAP search string (leave empty for default for MS Exchange)')
     parser.add_argument('--log', dest='log', action='store',
